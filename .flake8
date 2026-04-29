@@ -4,10 +4,9 @@ exclude =
     .git,
     __pycache__,
     venv,
-    backend/venv,
+    .venv,
     node_modules,
-    backend/catalog/migrations,
-    frontend/node_modules,
-    frontend/dist,
-    *.pyc
+    */migrations/*,
+    static,
+    media
 ignore = E203, W503, E501

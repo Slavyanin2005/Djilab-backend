@@ -14,6 +14,7 @@ minio_client = Minio(
     secure=False,
 )
 
+
 def init_bucket():
     try:
         if not minio_client.bucket_exists(settings.MINIO_BUCKET):

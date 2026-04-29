@@ -189,7 +189,6 @@ class OrderViewSet(viewsets.ModelViewSet):
         self._recalculate(order)
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
-
     @action(detail=True, methods=["put"])
     def form(self, request, pk=None):
         order = self.get_object()

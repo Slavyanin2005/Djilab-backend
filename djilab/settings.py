@@ -92,7 +92,6 @@ USE_I18N = config("USE_I18N", default=True, cast=bool)
 USE_TZ = config("USE_TZ", default=True, cast=bool)
 
 STATIC_URL = config("STATIC_URL", default="/static/")
-STATICFILES_DIRS = [BASE_DIR / "static"]
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MINIO_URL = config("MINIO_URL")

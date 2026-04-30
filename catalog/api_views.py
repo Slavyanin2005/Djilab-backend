@@ -12,7 +12,6 @@ from rest_framework.response import Response
 from .minio_client import generate_unique_filename, upload_to_minio
 from .models import Order, OrderItem, Service, UserProfile
 from .serializers import OrderSerializer, ServiceSerializer, UserProfileSerializer, UserRegistrationSerializer
-from .utils import get_current_user
 
 
 class ServiceViewSet(viewsets.ModelViewSet):
@@ -55,10 +54,13 @@ class ServiceViewSet(viewsets.ModelViewSet):
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
     @action(detail=True, methods=["post"])
+    @action(detail=True, methods=["post"])
     def add_to_order(self, request, pk=None):
         service = self.get_object()
         quantity = request.data.get("quantity", 1)
-        user = get_current_user()
+
+        # ✅ ПРАВИЛЬНО: берём пользователя из запроса (сессии)
+        user = request.user
 
         order = Order.objects.filter(creator=user, status="draft").first()
         if not order:
@@ -86,6 +88,8 @@ class OrderViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         queryset = Order.objects.filter(creator=user).exclude(status="deleted")
+        if user.is_staff:
+            queryset = Order.objects.exclude(status="deleted")
         if self.action == "list":
             queryset = queryset.exclude(status="draft")
         status_param = self.request.query_params.get("status")

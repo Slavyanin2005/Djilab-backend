@@ -1,3 +1,6 @@
+from django.contrib.auth import authenticate
+from django.contrib.auth import login as auth_login
+from django.contrib.auth import logout as auth_logout
 from django.db.models import Max
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -78,10 +81,11 @@ class ServiceViewSet(viewsets.ModelViewSet):
 
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = Order.objects.exclude(status="deleted")
+        user = self.request.user
+        queryset = Order.objects.filter(creator=user).exclude(status="deleted")
         if self.action == "list":
             queryset = queryset.exclude(status="draft")
         status_param = self.request.query_params.get("status")
@@ -100,20 +104,19 @@ class OrderViewSet(viewsets.ModelViewSet):
             {"error": "Заявка создается автоматически при добавлении услуги"}, status=status.HTTP_405_METHOD_NOT_ALLOWED
         )
 
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["get"], permission_classes=[AllowAny])
     def cart_icon(self, request):
-        user = get_current_user()
-        draft = Order.objects.filter(creator=user, status="draft").first()
-        if draft:
-            return Response({"id": draft.id, "items_count": draft.items_count})
+        user = self.request.user
+        if user.is_authenticated:
+            draft = Order.objects.filter(creator=user, status="draft").first()
+            if draft:
+                return Response({"id": draft.id, "items_count": draft.items_count})
         return Response({"id": None, "items_count": 0})
-
-    # НОВЫЕ REST МЕТОДЫ
 
     @action(detail=True, methods=["put"], url_path="update_item")
     def update_item(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
             return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
@@ -135,22 +138,19 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["delete"], url_path=r"items/(?P<service_id>\d+)")
     def delete_item(self, request, pk=None, service_id=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
             return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
 
-        # Удаляем позицию
         OrderItem.objects.filter(order=order, service_id=service_id).delete()
         self._recalculate(order)
         return Response(OrderSerializer(order).data)
 
-        # СТАРЫЕ МЕТОДЫ
-
     @action(detail=True, methods=["post"], url_path="update_item_legacy")
     def update_item_legacy(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
             return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
@@ -166,7 +166,6 @@ class OrderViewSet(viewsets.ModelViewSet):
             if order_item.quantity > 1:
                 order_item.quantity -= 1
             else:
-                # Если количество 1 и нажали "уменьшить" — удаляем позицию
                 order_item.delete()
                 self._recalculate(order)
                 return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
@@ -178,7 +177,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="remove_item")
     def remove_item_legacy(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
             return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
@@ -192,7 +191,7 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["put"])
     def form(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
         if order.creator != user or order.status != "draft":
             return Response({"error": "Только создатель может сформировать черновик"}, status=status.HTTP_403_FORBIDDEN)
         if order.items_count == 0:
@@ -205,6 +204,9 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["put"])
     def complete(self, request, pk=None):
         order = self.get_object()
+        user = self.request.user
+        if not user.is_staff:
+            return Response({"error": "Только модератор может завершать заявки"}, status=status.HTTP_403_FORBIDDEN)
         if order.status != "formed":
             return Response(
                 {"error": "Можно завершать только сформированные заявки"}, status=status.HTTP_400_BAD_REQUEST
@@ -212,13 +214,14 @@ class OrderViewSet(viewsets.ModelViewSet):
         action_type = request.data.get("action", "complete")
         order.status = "completed" if action_type == "complete" else "rejected"
         order.completed_at = timezone.now()
+        order.moderator = user
         order.save()
         return Response(OrderSerializer(order).data)
 
     @action(detail=True, methods=["post"])
     def delete(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
         if order.creator != user:
             return Response({"error": "Доступ запрещен"}, status=status.HTTP_403_FORBIDDEN)
         if order.status != "draft":
@@ -229,7 +232,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     def partial_update(self, request, pk=None, *args, **kwargs):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
         if order.creator != user:
             return Response({"error": "Доступ запрещен"}, status=status.HTTP_403_FORBIDDEN)
         return super().partial_update(request, pk, *args, **kwargs)
@@ -245,8 +248,9 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if self.request.user.is_authenticated:
-            return UserProfile.objects.filter(user=self.request.user)
+        user = self.request.user
+        if user.is_authenticated:
+            return UserProfile.objects.filter(user=user)
         return UserProfile.objects.none()
 
     @action(detail=False, methods=["post"], permission_classes=[AllowAny])
@@ -254,6 +258,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         serializer = UserRegistrationSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
+            auth_login(request, user)
             return Response(
                 {"id": user.id, "username": user.username, "message": "Регистрация успешна"},
                 status=status.HTTP_201_CREATED,
@@ -263,10 +268,27 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["post"], permission_classes=[AllowAny])
     def login(self, request):
         username = request.data.get("username")
-        if username:
-            return Response({"message": "Login stub OK", "token": "stub_token_123"})
-        return Response({"error": "Username required"}, status=status.HTTP_400_BAD_REQUEST)
+        password = request.data.get("password")
 
-    @action(detail=False, methods=["post"], permission_classes=[AllowAny])
+        if not username or not password:
+            return Response({"error": "Имя пользователя и пароль обязательны"}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = authenticate(request, username=username, password=password)
+
+        if user is not None:
+            auth_login(request, user)
+            return Response(
+                {"message": "Вход успешен", "username": user.username, "id": user.id, "is_staff": user.is_staff}
+            )
+
+        return Response({"error": "Неверное имя пользователя или пароль"}, status=status.HTTP_401_UNAUTHORIZED)
+
+    @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated])
     def logout(self, request):
-        return Response({"message": "Logout stub OK"})
+        auth_logout(request)
+        return Response({"message": "Выход успешен"})
+
+    @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated])
+    def me(self, request):
+        user = request.user
+        return Response({"id": user.id, "username": user.username, "email": user.email, "is_staff": user.is_staff})

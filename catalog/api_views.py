@@ -1,9 +1,12 @@
+import logging
+
 from django.contrib.auth import authenticate
 from django.contrib.auth import login as auth_login
 from django.contrib.auth import logout as auth_logout
 from django.db.models import Max
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from prometheus_client import Counter
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -12,6 +15,11 @@ from rest_framework.response import Response
 from .minio_client import generate_unique_filename, upload_to_minio
 from .models import Order, OrderItem, Service, UserProfile
 from .serializers import OrderSerializer, ServiceSerializer, UserProfileSerializer, UserRegistrationSerializer
+
+AUTH_SUCCESS = Counter("auth_login_success_total", "Successful login attempts")
+AUTH_FAILURE = Counter("auth_login_failed_total", "Failed login attempts")
+AUTH_REGISTER_SUCCESS = Counter("auth_register_success_total", "Successful registrations")
+logger = logging.getLogger(__name__)
 
 
 class ServiceViewSet(viewsets.ModelViewSet):
@@ -53,7 +61,6 @@ class ServiceViewSet(viewsets.ModelViewSet):
         headers = self.get_success_headers(serializer.data)
         return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
 
-    @action(detail=True, methods=["post"])
     @action(detail=True, methods=["post"])
     def add_to_order(self, request, pk=None):
         service = self.get_object()
@@ -263,10 +270,13 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         if serializer.is_valid():
             user = serializer.save()
             auth_login(request, user)
+            logger.info(f"Successful registration for user: {user.username}")
+            AUTH_REGISTER_SUCCESS.inc()
             return Response(
                 {"id": user.id, "username": user.username, "message": "Регистрация успешна"},
                 status=status.HTTP_201_CREATED,
             )
+        logger.warning(f"Failed registration attempt: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=["post"], permission_classes=[AllowAny])
@@ -275,20 +285,27 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         password = request.data.get("password")
 
         if not username or not password:
+            logger.warning(f"Failed login attempt (missing credentials): {username}")
+            AUTH_FAILURE.inc()
             return Response({"error": "Имя пользователя и пароль обязательны"}, status=status.HTTP_400_BAD_REQUEST)
 
         user = authenticate(request, username=username, password=password)
 
         if user is not None:
             auth_login(request, user)
+            logger.info(f"Successful login for user: {username}")
+            AUTH_SUCCESS.inc()
             return Response(
                 {"message": "Вход успешен", "username": user.username, "id": user.id, "is_staff": user.is_staff}
             )
 
+        logger.warning(f"Failed login attempt for user: {username}")
+        AUTH_FAILURE.inc()
         return Response({"error": "Неверное имя пользователя или пароль"}, status=status.HTTP_401_UNAUTHORIZED)
 
     @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated])
     def logout(self, request):
+        logger.info(f"Logout for user: {request.user.username}")
         auth_logout(request)
         return Response({"message": "Выход успешен"})
 

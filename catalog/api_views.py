@@ -87,6 +87,47 @@ class ServiceViewSet(viewsets.ModelViewSet):
 
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
+    @action(detail=True, methods=["get"])
+    def similar(self, request, pk=None):
+        service = self.get_object()
+        limit = int(request.query_params.get("limit", 4))
+
+        # Формируем текст для текущей услуги
+        current_text = f"{service.name} {service.description} {service.category}".lower()
+
+        # Получаем все активные услуги кроме текущей
+        all_services = Service.objects.filter(status="active").exclude(id=service.id)
+
+        # Вычисляем простую текстовую схожесть (Jaccard similarity для слов)
+        # В реальном приложении здесь были бы эмбеддинги из ML-модели
+        similarities = []
+
+        current_words = set(current_text.split())
+
+        for s in all_services:
+            service_text = f"{s.name} {s.description} {s.category}".lower()
+            service_words = set(service_text.split())
+
+            # Jaccard similarity
+            intersection = len(current_words.intersection(service_words))
+            union = len(current_words.union(service_words))
+
+            if union > 0:
+                similarity = intersection / union
+            else:
+                similarity = 0
+
+            similarities.append((s, similarity))
+
+        # Сортируем по убыванию схожести
+        similarities.sort(key=lambda x: x[1], reverse=True)
+
+        # Берем топ-N
+        similar_services = [s for s, _ in similarities[:limit]]
+
+        serializer = self.get_serializer(similar_services, many=True)
+        return Response(serializer.data)
+
 
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer

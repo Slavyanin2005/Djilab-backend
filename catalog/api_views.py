@@ -1,6 +1,13 @@
+# catalog/api_views.py
+import logging
+
+from django.contrib.auth import authenticate
+from django.contrib.auth import login as auth_login
+from django.contrib.auth import logout as auth_logout
 from django.db.models import Max
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from prometheus_client import Counter
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -9,7 +16,14 @@ from rest_framework.response import Response
 from .minio_client import generate_unique_filename, upload_to_minio
 from .models import Order, OrderItem, Service, UserProfile
 from .serializers import OrderSerializer, ServiceSerializer, UserProfileSerializer, UserRegistrationSerializer
-from .utils import get_current_user
+
+# Логгер
+logger = logging.getLogger(__name__)
+
+# Метрики Prometheus
+AUTH_SUCCESS = Counter("auth_login_success_total", "Successful login attempts")
+AUTH_FAILURE = Counter("auth_login_failed_total", "Failed login attempts")
+AUTH_REGISTER_SUCCESS = Counter("auth_register_success_total", "Successful registrations")
 
 
 class ServiceViewSet(viewsets.ModelViewSet):
@@ -33,7 +47,10 @@ class ServiceViewSet(viewsets.ModelViewSet):
             if uploaded_name:
                 data["image_key"] = uploaded_name
             else:
-                return Response({"error": "Ошибка загрузки изображения"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                return Response(
+                    {"error": "Ошибка загрузки изображения"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
 
         if "video" in request.FILES:
             file = request.FILES["video"]
@@ -43,7 +60,10 @@ class ServiceViewSet(viewsets.ModelViewSet):
             if uploaded_name:
                 data["video_key"] = uploaded_name
             else:
-                return Response({"error": "Ошибка загрузки видео"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+                return Response(
+                    {"error": "Ошибка загрузки видео"},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                )
 
         serializer = self.get_serializer(data=data)
         serializer.is_valid(raise_exception=True)
@@ -55,7 +75,13 @@ class ServiceViewSet(viewsets.ModelViewSet):
     def add_to_order(self, request, pk=None):
         service = self.get_object()
         quantity = request.data.get("quantity", 1)
-        user = get_current_user()
+
+        # ✅ ИСПОЛЬЗУЕМ request.user, а не get_current_user()
+        user = request.user
+
+        # Если пользователь не аутентифицирован — возвращаем ошибку
+        if not user.is_authenticated:
+            return Response({"error": "Требуется авторизация"}, status=status.HTTP_401_UNAUTHORIZED)
 
         order = Order.objects.filter(creator=user, status="draft").first()
         if not order:
@@ -75,13 +101,77 @@ class ServiceViewSet(viewsets.ModelViewSet):
 
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
+    # ✅ МЕТОД similar — на правильном уровне отступа!
+    @action(detail=True, methods=["get"])
+    def similar(self, request, pk=None):
+        """
+        Поиск похожих услуг на основе семантической близости описаний.
+        Используется косинусное сходство между векторами слов (Jaccard fallback).
+        """
+        service = self.get_object()
+        limit = int(request.query_params.get("limit", 4))
+
+        # Формируем текст для текущей услуги
+        current_text = f"{service.name} {service.description} {service.category}".lower()
+        current_words = set(current_text.split())
+
+        # Получаем все активные услуги кроме текущей
+        all_services = Service.objects.filter(status="active").exclude(id=service.id)
+
+        # Вычисляем схожесть (Jaccard similarity для слов)
+        similarities = []
+        for s in all_services:
+            service_text = f"{s.name} {s.description} {s.category}".lower()
+            service_words = set(service_text.split())
+
+            intersection = len(current_words.intersection(service_words))
+            union = len(current_words.union(service_words))
+            similarity = intersection / union if union > 0 else 0
+
+            similarities.append((s, similarity))
+
+        # Сортируем по убыванию и берем топ-N
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        similar_services = [s for s, _ in similarities[:limit]]
+
+        serializer = self.get_serializer(similar_services, many=True)
+        return Response(serializer.data)
+
+    def get_queryset(self):
+        """
+        Переопределяем queryset для поддержки фильтрации по цене.
+        Вызывается автоматически при каждом GET запросе к списку услуг.
+        """
+        queryset = Service.objects.filter(status="active")
+
+        # Фильтрация по минимальной цене
+        min_price = self.request.query_params.get("min_price")
+        if min_price:
+            try:
+                queryset = queryset.filter(price__gte=float(min_price))
+            except (ValueError, TypeError):
+                pass  # Игнорируем невалидные значения
+
+        # Фильтрация по максимальной цене
+        max_price = self.request.query_params.get("max_price")
+        if max_price:
+            try:
+                queryset = queryset.filter(price__lte=float(max_price))
+            except (ValueError, TypeError):
+                pass
+
+        return queryset
+
 
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
-    permission_classes = [AllowAny]
+    permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = Order.objects.exclude(status="deleted")
+        user = self.request.user
+        queryset = Order.objects.filter(creator=user).exclude(status="deleted")
+        if user.is_staff:
+            queryset = Order.objects.exclude(status="deleted")
         if self.action == "list":
             queryset = queryset.exclude(status="draft")
         status_param = self.request.query_params.get("status")
@@ -97,33 +187,35 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         return Response(
-            {"error": "Заявка создается автоматически при добавлении услуги"}, status=status.HTTP_405_METHOD_NOT_ALLOWED
+            {"error": "Заявка создается автоматически при добавлении услуги"},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
         )
 
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["get"], permission_classes=[AllowAny])
     def cart_icon(self, request):
-        user = get_current_user()
-        draft = Order.objects.filter(creator=user, status="draft").first()
-        if draft:
-            return Response({"id": draft.id, "items_count": draft.items_count})
+        user = self.request.user
+        if user.is_authenticated:
+            draft = Order.objects.filter(creator=user, status="draft").first()
+            if draft:
+                return Response({"id": draft.id, "items_count": draft.items_count})
         return Response({"id": None, "items_count": 0})
-
-    # НОВЫЕ REST МЕТОДЫ
 
     @action(detail=True, methods=["put"], url_path="update_item")
     def update_item(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
-            return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"error": "Доступ запрещен или заявка не черновик"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         service_id = request.data.get("service_id")
         if not service_id:
             return Response({"error": "Требуется поле service_id"}, status=status.HTTP_400_BAD_REQUEST)
 
         item = get_object_or_404(OrderItem, order=order, service_id=service_id)
-
         quantity = request.data.get("quantity")
         if quantity is not None:
             item.quantity = quantity
@@ -135,29 +227,31 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["delete"], url_path=r"items/(?P<service_id>\d+)")
     def delete_item(self, request, pk=None, service_id=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
-            return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"error": "Доступ запрещен или заявка не черновик"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
-        # Удаляем позицию
         OrderItem.objects.filter(order=order, service_id=service_id).delete()
         self._recalculate(order)
         return Response(OrderSerializer(order).data)
 
-        # СТАРЫЕ МЕТОДЫ
-
     @action(detail=True, methods=["post"], url_path="update_item_legacy")
     def update_item_legacy(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
-            return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"error": "Доступ запрещен или заявка не черновик"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         item_id = request.data.get("item_id")
         action = request.data.get("action")
-
         order_item = get_object_or_404(OrderItem, id=item_id, order=order)
 
         if action == "increase":
@@ -166,7 +260,6 @@ class OrderViewSet(viewsets.ModelViewSet):
             if order_item.quantity > 1:
                 order_item.quantity -= 1
             else:
-                # Если количество 1 и нажали "уменьшить" — удаляем позицию
                 order_item.delete()
                 self._recalculate(order)
                 return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
@@ -178,25 +271,33 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path="remove_item")
     def remove_item_legacy(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
 
         if order.creator != user or order.status != "draft":
-            return Response({"error": "Доступ запрещен или заявка не черновик"}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"error": "Доступ запрещен или заявка не черновик"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         item_id = request.data.get("item_id")
         OrderItem.objects.filter(id=item_id, order=order).delete()
-
         self._recalculate(order)
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["put"])
     def form(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
         if order.creator != user or order.status != "draft":
-            return Response({"error": "Только создатель может сформировать черновик"}, status=status.HTTP_403_FORBIDDEN)
+            return Response(
+                {"error": "Только создатель может сформировать черновик"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         if order.items_count == 0:
-            return Response({"error": "Нельзя сформировать пустую заявку"}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Нельзя сформировать пустую заявку"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         order.status = "formed"
         order.formed_at = timezone.now()
         order.save()
@@ -205,20 +306,28 @@ class OrderViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["put"])
     def complete(self, request, pk=None):
         order = self.get_object()
+        user = self.request.user
+        if not user.is_staff:
+            return Response(
+                {"error": "Только модератор может завершать заявки"},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         if order.status != "formed":
             return Response(
-                {"error": "Можно завершать только сформированные заявки"}, status=status.HTTP_400_BAD_REQUEST
+                {"error": "Можно завершать только сформированные заявки"},
+                status=status.HTTP_400_BAD_REQUEST,
             )
         action_type = request.data.get("action", "complete")
         order.status = "completed" if action_type == "complete" else "rejected"
         order.completed_at = timezone.now()
+        order.moderator = user
         order.save()
         return Response(OrderSerializer(order).data)
 
     @action(detail=True, methods=["post"])
     def delete(self, request, pk=None):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
         if order.creator != user:
             return Response({"error": "Доступ запрещен"}, status=status.HTTP_403_FORBIDDEN)
         if order.status != "draft":
@@ -229,7 +338,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 
     def partial_update(self, request, pk=None, *args, **kwargs):
         order = self.get_object()
-        user = get_current_user()
+        user = self.request.user
         if order.creator != user:
             return Response({"error": "Доступ запрещен"}, status=status.HTTP_403_FORBIDDEN)
         return super().partial_update(request, pk, *args, **kwargs)
@@ -245,8 +354,9 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        if self.request.user.is_authenticated:
-            return UserProfile.objects.filter(user=self.request.user)
+        user = self.request.user
+        if user.is_authenticated:
+            return UserProfile.objects.filter(user=user)
         return UserProfile.objects.none()
 
     @action(detail=False, methods=["post"], permission_classes=[AllowAny])
@@ -254,19 +364,64 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         serializer = UserRegistrationSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
+            auth_login(request, user)
+            logger.info(f"Successful registration for user: {user.username}")
+            AUTH_REGISTER_SUCCESS.inc()
             return Response(
                 {"id": user.id, "username": user.username, "message": "Регистрация успешна"},
                 status=status.HTTP_201_CREATED,
             )
+        logger.warning(f"Failed registration attempt: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=False, methods=["post"], permission_classes=[AllowAny])
     def login(self, request):
         username = request.data.get("username")
-        if username:
-            return Response({"message": "Login stub OK", "token": "stub_token_123"})
-        return Response({"error": "Username required"}, status=status.HTTP_400_BAD_REQUEST)
+        password = request.data.get("password")
 
-    @action(detail=False, methods=["post"], permission_classes=[AllowAny])
+        if not username or not password:
+            logger.warning(f"Failed login attempt (missing credentials): {username}")
+            AUTH_FAILURE.inc()
+            return Response(
+                {"error": "Имя пользователя и пароль обязательны"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        user = authenticate(request, username=username, password=password)
+        if user is not None:
+            auth_login(request, user)
+            logger.info(f"Successful login for user: {username}")
+            AUTH_SUCCESS.inc()
+            return Response(
+                {
+                    "message": "Вход успешен",
+                    "username": user.username,
+                    "id": user.id,
+                    "is_staff": user.is_staff,
+                }
+            )
+
+        logger.warning(f"Failed login attempt for user: {username}")
+        AUTH_FAILURE.inc()
+        return Response(
+            {"error": "Неверное имя пользователя или пароль"},
+            status=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated])
     def logout(self, request):
-        return Response({"message": "Logout stub OK"})
+        logger.info(f"Logout for user: {request.user.username}")
+        auth_logout(request)
+        return Response({"message": "Выход успешен"})
+
+    @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated])
+    def me(self, request):
+        user = request.user
+        return Response(
+            {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "is_staff": user.is_staff,
+            }
+        )

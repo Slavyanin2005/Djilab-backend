@@ -10,3 +10,9 @@ django-cors-headers==4.3.1
 pre-commit==3.7.1
 minio==7.2.7
 Pillow
+django-prometheus==2.3.1
+django-redis>=5.4.0
+pytest==8.3.5
+pytest-django==4.9.0
+pytest-cov==5.0.0
+factory-boy==3.3.1

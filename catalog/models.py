@@ -96,7 +96,8 @@ class OrderItem(models.Model):
 
     def save(self, *args, **kwargs):
         if self.service and self.quantity:
-            self.subtotal = self.service.price * self.quantity
+            qty = int(self.quantity)
+            self.subtotal = self.service.price * qty
         super().save(*args, **kwargs)
 
     class Meta:

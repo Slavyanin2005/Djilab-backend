@@ -1,9 +1,11 @@
 # catalog/api_views.py
-import logging
+import hashlib
+import logging  # ← Модуль логирования
 
 from django.contrib.auth import authenticate
 from django.contrib.auth import login as auth_login
 from django.contrib.auth import logout as auth_logout
+from django.core.cache import cache
 from django.db.models import Max
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -13,17 +15,17 @@ from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
-from .minio_client import generate_unique_filename, upload_to_minio
 from .models import Order, OrderItem, Service, UserProfile
 from .serializers import OrderSerializer, ServiceSerializer, UserProfileSerializer, UserRegistrationSerializer
 
-# Логгер
 logger = logging.getLogger(__name__)
 
 # Метрики Prometheus
 AUTH_SUCCESS = Counter("auth_login_success_total", "Successful login attempts")
 AUTH_FAILURE = Counter("auth_login_failed_total", "Failed login attempts")
 AUTH_REGISTER_SUCCESS = Counter("auth_register_success_total", "Successful registrations")
+
+CACHE_TTL = 300
 
 
 class ServiceViewSet(viewsets.ModelViewSet):
@@ -34,52 +36,97 @@ class ServiceViewSet(viewsets.ModelViewSet):
     ordering_fields = ["price", "name", "created_at"]
     permission_classes = [AllowAny]
 
+    def _get_cache_key(self, prefix: str, params: dict = None) -> str:
+        """Генерирует уникальный ключ кэша на основе параметров запроса."""
+        param_str = f"{sorted(params.items())}" if params else ""
+        key_base = f"{prefix}_{param_str}"
+        return f"djilab_services_{hashlib.md5(key_base.encode()).hexdigest()[:12]}"
+
+    def list(self, request, *args, **kwargs):
+        """Переопределяем list для добавления кэширования."""
+        # Формируем ключ кэша на основе параметров фильтрации
+        cache_key = self._get_cache_key("list", dict(request.query_params))
+
+        # Пытаемся получить из кэша
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            # LOG: Кэш попал — данные взяты из Redis, а не из БД
+            logger.info(f"CACHE HIT: key={cache_key}")
+            response = Response(cached_data)
+            response.headers["X-Cache-Status"] = "HIT"
+            return response
+
+        # LOG: Кэш промах — данных нет, идём в БД
+        logger.info(f"CACHE MISS: key={cache_key}. Fetching from DB.")
+
+        # Стандартная логика DRF
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            data = self.get_paginated_response(serializer.data).data
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+            data = serializer.data
+
+        # Сохраняем в кэш (CACHE SET)
+        cache.set(cache_key, data, timeout=CACHE_TTL)
+        # LOG: Данные записаны в кэш с указанием TTL
+        logger.info(f"CACHE SET: key={cache_key}, TTL={CACHE_TTL}s")
+
+        response = Response(data)
+        response.headers["X-Cache-Status"] = "MISS"
+        return response
+
     def create(self, request, *args, **kwargs):
-        data = {}
-        for key, value in request.data.items():
-            data[key] = value
+        """Создание услуги с инвалидацией кэша."""
+        response = super().create(request, *args, **kwargs)
+        self._invalidate_services_cache()
+        # LOG: Кэш сброшен после создания новой услуги
+        logger.info("CACHE INVALIDATED: services cache after CREATE")
+        return response
 
-        if "image" in request.FILES:
-            file = request.FILES["image"]
-            service_name = request.data.get("name", "service")
-            filename = generate_unique_filename(file.name, service_name)
-            uploaded_name = upload_to_minio(file, filename)
-            if uploaded_name:
-                data["image_key"] = uploaded_name
-            else:
-                return Response(
-                    {"error": "Ошибка загрузки изображения"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
+    def update(self, request, *args, **kwargs):
+        """Обновление услуги с инвалидацией кэша."""
+        response = super().update(request, *args, **kwargs)
+        self._invalidate_services_cache()
+        # LOG: Кэш сброшен после обновления услуги
+        logger.info("🗑️ CACHE INVALIDATED: services cache after UPDATE")
+        return response
 
-        if "video" in request.FILES:
-            file = request.FILES["video"]
-            service_name = request.data.get("name", "service")
-            filename = generate_unique_filename(file.name, service_name)
-            uploaded_name = upload_to_minio(file, filename)
-            if uploaded_name:
-                data["video_key"] = uploaded_name
-            else:
-                return Response(
-                    {"error": "Ошибка загрузки видео"},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                )
+    def destroy(self, request, *args, **kwargs):
+        """Удаление услуги с инвалидацией кэша."""
+        response = super().destroy(request, *args, **kwargs)
+        self._invalidate_services_cache()
+        # LOG: Кэш сброшен после удаления услуги
+        logger.info("🗑️ CACHE INVALIDATED: services cache after DELETE")
+        return response
 
-        serializer = self.get_serializer(data=data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+    def _invalidate_services_cache(self):
+        """Удаляет все ключи кэша, связанные со списком услуг."""
+        try:
+            from django_redis import get_redis_connection
+
+            redis_conn = get_redis_connection("default")
+
+            pattern = "djilab*djilab_services_*"
+
+            for key in redis_conn.scan_iter(match=pattern):
+                redis_conn.delete(key)
+                # LOG (DEBUG): Удалён конкретный ключ кэша (видно только при DEBUG=True)
+                logger.debug(f"🗑️ Deleted cache key: {key.decode()}")
+
+        except Exception as e:
+            # LOG (ERROR): Ошибка при инвалидации кэша
+            logger.error(f"Failed to invalidate cache: {e}")
 
     @action(detail=True, methods=["post"])
     def add_to_order(self, request, pk=None):
         service = self.get_object()
         quantity = request.data.get("quantity", 1)
 
-        # ✅ ИСПОЛЬЗУЕМ request.user, а не get_current_user()
         user = request.user
-
-        # Если пользователь не аутентифицирован — возвращаем ошибку
         if not user.is_authenticated:
             return Response({"error": "Требуется авторизация"}, status=status.HTTP_401_UNAUTHORIZED)
 
@@ -101,36 +148,24 @@ class ServiceViewSet(viewsets.ModelViewSet):
 
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
-    # ✅ МЕТОД similar — на правильном уровне отступа!
     @action(detail=True, methods=["get"])
     def similar(self, request, pk=None):
-        """
-        Поиск похожих услуг на основе семантической близости описаний.
-        Используется косинусное сходство между векторами слов (Jaccard fallback).
-        """
         service = self.get_object()
         limit = int(request.query_params.get("limit", 4))
 
-        # Формируем текст для текущей услуги
         current_text = f"{service.name} {service.description} {service.category}".lower()
         current_words = set(current_text.split())
-
-        # Получаем все активные услуги кроме текущей
         all_services = Service.objects.filter(status="active").exclude(id=service.id)
 
-        # Вычисляем схожесть (Jaccard similarity для слов)
         similarities = []
         for s in all_services:
             service_text = f"{s.name} {s.description} {s.category}".lower()
             service_words = set(service_text.split())
-
             intersection = len(current_words.intersection(service_words))
             union = len(current_words.union(service_words))
             similarity = intersection / union if union > 0 else 0
-
             similarities.append((s, similarity))
 
-        # Сортируем по убыванию и берем топ-N
         similarities.sort(key=lambda x: x[1], reverse=True)
         similar_services = [s for s, _ in similarities[:limit]]
 
@@ -138,21 +173,15 @@ class ServiceViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
     def get_queryset(self):
-        """
-        Переопределяем queryset для поддержки фильтрации по цене.
-        Вызывается автоматически при каждом GET запросе к списку услуг.
-        """
         queryset = Service.objects.filter(status="active")
 
-        # Фильтрация по минимальной цене
         min_price = self.request.query_params.get("min_price")
         if min_price:
             try:
                 queryset = queryset.filter(price__gte=float(min_price))
             except (ValueError, TypeError):
-                pass  # Игнорируем невалидные значения
+                pass
 
-        # Фильтрация по максимальной цене
         max_price = self.request.query_params.get("max_price")
         if max_price:
             try:
@@ -365,12 +394,14 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         if serializer.is_valid():
             user = serializer.save()
             auth_login(request, user)
+            # LOG: Успешная регистрация пользователя
             logger.info(f"Successful registration for user: {user.username}")
             AUTH_REGISTER_SUCCESS.inc()
             return Response(
                 {"id": user.id, "username": user.username, "message": "Регистрация успешна"},
                 status=status.HTTP_201_CREATED,
             )
+        # LOG: Попытка регистрации с ошибкой валидации
         logger.warning(f"Failed registration attempt: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -380,6 +411,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         password = request.data.get("password")
 
         if not username or not password:
+            # LOG: Попытка входа без обязательных полей
             logger.warning(f"Failed login attempt (missing credentials): {username}")
             AUTH_FAILURE.inc()
             return Response(
@@ -390,6 +422,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         user = authenticate(request, username=username, password=password)
         if user is not None:
             auth_login(request, user)
+            # LOG: Успешный вход пользователя
             logger.info(f"Successful login for user: {username}")
             AUTH_SUCCESS.inc()
             return Response(
@@ -401,6 +434,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
                 }
             )
 
+        # LOG: Неверный пароль или пользователь
         logger.warning(f"Failed login attempt for user: {username}")
         AUTH_FAILURE.inc()
         return Response(
@@ -410,6 +444,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated])
     def logout(self, request):
+        # LOG: Выход пользователя из системы
         logger.info(f"Logout for user: {request.user.username}")
         auth_logout(request)
         return Response({"message": "Выход успешен"})

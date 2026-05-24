@@ -25,6 +25,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "corsheaders",
     "catalog",
+    "drf_spectacular",
 ]
 
 MIDDLEWARE = [
@@ -174,6 +175,7 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
     ],
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
 
 CORS_ALLOW_HEADERS = config(
@@ -192,3 +194,15 @@ SESSION_COOKIE_SAMESITE = config("SESSION_COOKIE_SAMESITE", default="Lax")
 SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=False, cast=bool)
 CSRF_COOKIE_SAMESITE = config("CSRF_COOKIE_SAMESITE", default="Lax")
 CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=False, cast=bool)
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "DJI Lab API",
+    "DESCRIPTION": "API для системы заказа лабораторного оборудования",
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": True,
+    "COMPONENT_SPLIT_REQUEST": True,
+    "ENUM_NAME_OVERRIDES": {
+        "OrderStatusEnum": "catalog.models.ORDER_STATUS_CHOICES",
+        "ServiceStatusEnum": "catalog.models.SERVICE_STATUS_CHOICES",
+    },
+}

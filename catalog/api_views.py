@@ -1,6 +1,6 @@
 # catalog/api_views.py
 import hashlib
-import logging  # ← Модуль логирования
+import logging
 
 from django.contrib.auth import authenticate
 from django.contrib.auth import login as auth_login
@@ -9,7 +9,7 @@ from django.core.cache import cache
 from django.db.models import Max
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 from rest_framework import filters, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -24,8 +24,11 @@ logger = logging.getLogger(__name__)
 AUTH_SUCCESS = Counter("auth_login_success_total", "Successful login attempts")
 AUTH_FAILURE = Counter("auth_login_failed_total", "Failed login attempts")
 AUTH_REGISTER_SUCCESS = Counter("auth_register_success_total", "Successful registrations")
+CACHE_HIT = Counter("cache_hits_total", "Cache hit count", ["resource"])
+CACHE_MISS = Counter("cache_misses_total", "Cache miss count", ["resource"])
+CACHE_MEMORY_USAGE = Gauge("cache_memory_usage_bytes", "Redis memory usage in bytes")
 
-CACHE_TTL = 300
+CACHE_TTL = 600
 
 
 class ServiceViewSet(viewsets.ModelViewSet):
@@ -50,13 +53,13 @@ class ServiceViewSet(viewsets.ModelViewSet):
         # Пытаемся получить из кэша
         cached_data = cache.get(cache_key)
         if cached_data is not None:
-            # LOG: Кэш попал — данные взяты из Redis, а не из БД
+            # Кэш попал — данные взяты из Redis, а не из БД
             logger.info(f"CACHE HIT: key={cache_key}")
             response = Response(cached_data)
             response.headers["X-Cache-Status"] = "HIT"
             return response
 
-        # LOG: Кэш промах — данных нет, идём в БД
+        # Кэш промах данных нет, идём в БД
         logger.info(f"CACHE MISS: key={cache_key}. Fetching from DB.")
 
         # Стандартная логика DRF
@@ -70,9 +73,9 @@ class ServiceViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(queryset, many=True)
             data = serializer.data
 
-        # Сохраняем в кэш (CACHE SET)
+        # Сохраняем в кэш
         cache.set(cache_key, data, timeout=CACHE_TTL)
-        # LOG: Данные записаны в кэш с указанием TTL
+        # Данные записаны в кэш с указанием TTL
         logger.info(f"CACHE SET: key={cache_key}, TTL={CACHE_TTL}s")
 
         response = Response(data)
@@ -83,7 +86,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
         """Создание услуги с инвалидацией кэша."""
         response = super().create(request, *args, **kwargs)
         self._invalidate_services_cache()
-        # LOG: Кэш сброшен после создания новой услуги
+        # Кэш сброшен после создания новой услуги
         logger.info("CACHE INVALIDATED: services cache after CREATE")
         return response
 
@@ -91,7 +94,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
         """Обновление услуги с инвалидацией кэша."""
         response = super().update(request, *args, **kwargs)
         self._invalidate_services_cache()
-        # LOG: Кэш сброшен после обновления услуги
+        # Кэш сброшен после обновления услуги
         logger.info("🗑️ CACHE INVALIDATED: services cache after UPDATE")
         return response
 
@@ -99,7 +102,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
         """Удаление услуги с инвалидацией кэша."""
         response = super().destroy(request, *args, **kwargs)
         self._invalidate_services_cache()
-        # LOG: Кэш сброшен после удаления услуги
+        # Кэш сброшен после удаления услуги
         logger.info("🗑️ CACHE INVALIDATED: services cache after DELETE")
         return response
 
@@ -118,7 +121,7 @@ class ServiceViewSet(viewsets.ModelViewSet):
                 logger.debug(f"🗑️ Deleted cache key: {key.decode()}")
 
         except Exception as e:
-            # LOG (ERROR): Ошибка при инвалидации кэша
+            # Ошибка при инвалидации кэша
             logger.error(f"Failed to invalidate cache: {e}")
 
     @action(detail=True, methods=["post"])
@@ -366,10 +369,47 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
     def partial_update(self, request, pk=None, *args, **kwargs):
+        """
+        PATCH /api/orders/{id}/
+        - Создатель: любые поля (кроме статуса)
+        - Модератор: comment ИЛИ status
+        """
         order = self.get_object()
         user = self.request.user
-        if order.creator != user:
+
+        # Проверка прав
+        if order.creator != user and not user.is_staff:
             return Response({"error": "Доступ запрещен"}, status=status.HTTP_403_FORBIDDEN)
+
+        if "comment" in request.data and request.data["comment"]:
+            new_comment = request.data["comment"].strip()
+            if new_comment:
+                timestamp = timezone.now().strftime("%d.%m.%Y %H:%M")
+                author = "Модератор" if user.is_staff else user.username
+                comment_entry = f"[{timestamp}] {author}: {new_comment}\n"
+                existing = order.comment or ""
+                order.comment = existing + comment_entry
+                order.save(update_fields=["comment"])
+                return Response(OrderSerializer(order).data)
+
+        if "status" in request.data and user.is_staff:
+            new_status = request.data["status"]
+            valid_statuses = ["draft", "formed", "completed", "rejected", "deleted"]
+            if new_status in valid_statuses:
+                if order.status == "completed" and new_status == "formed":
+                    order.status = new_status
+                    order.completed_at = None
+                    order.moderator = None
+                    order.save(update_fields=["status", "completed_at", "moderator"])
+                    return Response(OrderSerializer(order).data)
+
+                order.status = new_status
+                if new_status in ["completed", "rejected"]:
+                    order.completed_at = timezone.now()
+                    order.moderator = user
+                order.save(update_fields=["status", "completed_at", "moderator"])
+                return Response(OrderSerializer(order).data)
+
         return super().partial_update(request, pk, *args, **kwargs)
 
     def _recalculate(self, order):
@@ -394,14 +434,14 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         if serializer.is_valid():
             user = serializer.save()
             auth_login(request, user)
-            # LOG: Успешная регистрация пользователя
+            # Успешная регистрация пользователя
             logger.info(f"Successful registration for user: {user.username}")
             AUTH_REGISTER_SUCCESS.inc()
             return Response(
                 {"id": user.id, "username": user.username, "message": "Регистрация успешна"},
                 status=status.HTTP_201_CREATED,
             )
-        # LOG: Попытка регистрации с ошибкой валидации
+        # Попытка регистрации с ошибкой валидации
         logger.warning(f"Failed registration attempt: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -411,7 +451,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         password = request.data.get("password")
 
         if not username or not password:
-            # LOG: Попытка входа без обязательных полей
+            # Попытка входа без обязательных полей
             logger.warning(f"Failed login attempt (missing credentials): {username}")
             AUTH_FAILURE.inc()
             return Response(
@@ -422,7 +462,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         user = authenticate(request, username=username, password=password)
         if user is not None:
             auth_login(request, user)
-            # LOG: Успешный вход пользователя
+            # Успешный вход пользователя
             logger.info(f"Successful login for user: {username}")
             AUTH_SUCCESS.inc()
             return Response(
@@ -434,7 +474,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
                 }
             )
 
-        # LOG: Неверный пароль или пользователь
+        # Неверный пароль или пользователь
         logger.warning(f"Failed login attempt for user: {username}")
         AUTH_FAILURE.inc()
         return Response(
@@ -444,7 +484,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated])
     def logout(self, request):
-        # LOG: Выход пользователя из системы
+        # Выход пользователя из системы
         logger.info(f"Logout for user: {request.user.username}")
         auth_logout(request)
         return Response({"message": "Выход успешен"})

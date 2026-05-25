@@ -1,4 +1,5 @@
 from django.contrib.auth.models import User
+from django.core.validators import RegexValidator
 from rest_framework import serializers
 
 from .models import Order, OrderItem, Service, UserProfile
@@ -19,21 +20,48 @@ class UserProfileSerializer(serializers.ModelSerializer):
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, min_length=6)
+    password = serializers.CharField(write_only=True, min_length=8)
+    email = serializers.EmailField(required=True)
+
+    # ✅ Валидатор: только латиница, цифры, подчёркивание
+    username = serializers.CharField(
+        required=True,
+        validators=[
+            RegexValidator(
+                regex=r"^[a-zA-Z0-9_]+$",
+                message="Имя пользователя может содержать только латинские буквы, цифры и подчёркивание.",
+            )
+        ],
+    )
 
     class Meta:
         model = User
         fields = ["username", "email", "password", "first_name", "last_name"]
+        extra_kwargs = {
+            "first_name": {"required": False},
+            "last_name": {"required": False},
+        }
+
+    def validate_username(self, value):
+        # ✅ Приводим к нижнему регистру
+        return value.lower()
+
+    def validate_email(self, value):
+        # ✅ Проверяем уникальность email
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("Пользователь с таким email уже существует.")
+        return value.lower()
 
     def create(self, validated_data):
+        # ✅ Создаём пользователя с хешированным паролем
         user = User.objects.create_user(
-            username=validated_data["username"],
-            email=validated_data.get("email", ""),
+            username=validated_data["username"].lower(),
+            email=validated_data["email"].lower(),
             password=validated_data["password"],
             first_name=validated_data.get("first_name", ""),
             last_name=validated_data.get("last_name", ""),
         )
-        # Создаем профиль пользователя автоматически
+        # ✅ Создаём профиль автоматически
         UserProfile.objects.create(user=user)
         return user
 

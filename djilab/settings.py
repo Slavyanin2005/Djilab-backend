@@ -41,7 +41,11 @@ MIDDLEWARE = [
     "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
-CORS_ALLOWED_ORIGINS = config("CORS_ALLOWED_ORIGINS", default="http://localhost:5173,http://127.0.0.1:5173", cast=Csv())
+CORS_ALLOWED_ORIGINS = config(
+    "CORS_ALLOWED_ORIGINS",
+    default="http://localhost:5173,http://127.0.0.1:5173,http://192.168.0.107:5173,tauri://localhost,http://localhost:1420,https://slavyanin2005.github.io",
+    cast=Csv(),
+)
 CORS_ALLOW_CREDENTIALS = config("CORS_ALLOW_CREDENTIALS", default=True, cast=bool)
 
 ROOT_URLCONF = "djilab.urls"
@@ -171,7 +175,6 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",
     ],
-    # ✅ ДОБАВЬТЕ ЭТО:
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
     ],
@@ -187,7 +190,11 @@ CORS_ALLOW_HEADERS = config(
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://192.168.0.107:5173",
     "http://backend:8000",
+    "tauri://localhost",
+    "http://localhost:1420",
+    "https://slavyanin2005.github.io",
 ]
 
 SESSION_COOKIE_SAMESITE = config("SESSION_COOKIE_SAMESITE", default="Lax")

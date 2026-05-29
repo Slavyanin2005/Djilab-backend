@@ -1,4 +1,3 @@
-# catalog/api_views.py
 import hashlib
 import logging
 
@@ -20,7 +19,6 @@ from .serializers import OrderSerializer, ServiceSerializer, UserProfileSerializ
 
 logger = logging.getLogger(__name__)
 
-# Метрики Prometheus
 AUTH_SUCCESS = Counter("auth_login_success_total", "Successful login attempts")
 AUTH_FAILURE = Counter("auth_login_failed_total", "Failed login attempts")
 AUTH_REGISTER_SUCCESS = Counter("auth_register_success_total", "Successful registrations")
@@ -40,32 +38,22 @@ class ServiceViewSet(viewsets.ModelViewSet):
     permission_classes = [AllowAny]
 
     def _get_cache_key(self, prefix: str, params: dict = None) -> str:
-        """Генерирует уникальный ключ кэша на основе параметров запроса."""
         param_str = f"{sorted(params.items())}" if params else ""
         key_base = f"{prefix}_{param_str}"
         return f"djilab_services_{hashlib.md5(key_base.encode()).hexdigest()[:12]}"
 
     def list(self, request, *args, **kwargs):
-        """Переопределяем list для добавления кэширования."""
-        # Формируем ключ кэша на основе параметров фильтрации
         cache_key = self._get_cache_key("list", dict(request.query_params))
-
-        # Пытаемся получить из кэша
         cached_data = cache.get(cache_key)
         if cached_data is not None:
-            # Кэш попал — данные взяты из Redis, а не из БД
             logger.info(f"CACHE HIT: key={cache_key}")
             response = Response(cached_data)
             response.headers["X-Cache-Status"] = "HIT"
             return response
 
-        # Кэш промах данных нет, идём в БД
         logger.info(f"CACHE MISS: key={cache_key}. Fetching from DB.")
-
-        # Стандартная логика DRF
         queryset = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(queryset)
-
         if page is not None:
             serializer = self.get_serializer(page, many=True)
             data = self.get_paginated_response(serializer.data).data
@@ -73,93 +61,71 @@ class ServiceViewSet(viewsets.ModelViewSet):
             serializer = self.get_serializer(queryset, many=True)
             data = serializer.data
 
-        # Сохраняем в кэш
         cache.set(cache_key, data, timeout=CACHE_TTL)
-        # Данные записаны в кэш с указанием TTL
         logger.info(f"CACHE SET: key={cache_key}, TTL={CACHE_TTL}s")
-
         response = Response(data)
         response.headers["X-Cache-Status"] = "MISS"
         return response
 
     def create(self, request, *args, **kwargs):
-        """Создание услуги с инвалидацией кэша."""
         response = super().create(request, *args, **kwargs)
         self._invalidate_services_cache()
-        # Кэш сброшен после создания новой услуги
         logger.info("CACHE INVALIDATED: services cache after CREATE")
         return response
 
     def update(self, request, *args, **kwargs):
-        """Обновление услуги с инвалидацией кэша."""
         response = super().update(request, *args, **kwargs)
         self._invalidate_services_cache()
-        # Кэш сброшен после обновления услуги
-        logger.info("🗑️ CACHE INVALIDATED: services cache after UPDATE")
+        logger.info("CACHE INVALIDATED: services cache after UPDATE")
         return response
 
     def destroy(self, request, *args, **kwargs):
-        """Удаление услуги с инвалидацией кэша."""
         response = super().destroy(request, *args, **kwargs)
         self._invalidate_services_cache()
-        # Кэш сброшен после удаления услуги
-        logger.info("🗑️ CACHE INVALIDATED: services cache after DELETE")
+        logger.info("CACHE INVALIDATED: services cache after DELETE")
         return response
 
     def _invalidate_services_cache(self):
-        """Удаляет все ключи кэша, связанные со списком услуг."""
         try:
             from django_redis import get_redis_connection
 
             redis_conn = get_redis_connection("default")
-
             pattern = "djilab*djilab_services_*"
-
             for key in redis_conn.scan_iter(match=pattern):
                 redis_conn.delete(key)
-                # LOG (DEBUG): Удалён конкретный ключ кэша (видно только при DEBUG=True)
-                logger.debug(f"🗑️ Deleted cache key: {key.decode()}")
-
+                logger.debug(f"Deleted cache key: {key.decode()}")
         except Exception as e:
-            # Ошибка при инвалидации кэша
             logger.error(f"Failed to invalidate cache: {e}")
 
     @action(detail=True, methods=["post"])
     def add_to_order(self, request, pk=None):
         service = self.get_object()
         quantity = request.data.get("quantity", 1)
-
         user = request.user
         if not user.is_authenticated:
             return Response({"error": "Требуется авторизация"}, status=status.HTTP_401_UNAUTHORIZED)
-
         order = Order.objects.filter(creator=user, status="draft").first()
         if not order:
             max_id = Order.objects.aggregate(Max("id"))["id__max"] or 0
             order = Order.objects.create(id=max_id + 1, status="draft", creator=user)
-
         order_item, created = OrderItem.objects.get_or_create(
             order=order, service=service, defaults={"quantity": quantity}
         )
         if not created:
             order_item.quantity += quantity
             order_item.save()
-
         order.items_count = OrderItem.objects.filter(order=order).count()
         order.total = sum(item.subtotal for item in OrderItem.objects.filter(order=order))
         order.save()
-
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"])
     def similar(self, request, pk=None):
         service = self.get_object()
         limit = int(request.query_params.get("limit", 4))
-
         current_text = f"{service.name} {service.description} {service.category}".lower()
         current_words = set(current_text.split())
         all_services = Service.objects.filter(status="active").exclude(id=service.id)
-
         similarities = []
         for s in all_services:
             service_text = f"{s.name} {s.description} {s.category}".lower()
@@ -168,30 +134,25 @@ class ServiceViewSet(viewsets.ModelViewSet):
             union = len(current_words.union(service_words))
             similarity = intersection / union if union > 0 else 0
             similarities.append((s, similarity))
-
         similarities.sort(key=lambda x: x[1], reverse=True)
         similar_services = [s for s, _ in similarities[:limit]]
-
         serializer = self.get_serializer(similar_services, many=True)
         return Response(serializer.data)
 
     def get_queryset(self):
         queryset = Service.objects.filter(status="active")
-
         min_price = self.request.query_params.get("min_price")
         if min_price:
             try:
                 queryset = queryset.filter(price__gte=float(min_price))
             except (ValueError, TypeError):
                 pass
-
         max_price = self.request.query_params.get("max_price")
         if max_price:
             try:
                 queryset = queryset.filter(price__lte=float(max_price))
             except (ValueError, TypeError):
                 pass
-
         return queryset
 
 
@@ -236,23 +197,19 @@ class OrderViewSet(viewsets.ModelViewSet):
     def update_item(self, request, pk=None):
         order = self.get_object()
         user = self.request.user
-
         if order.creator != user or order.status != "draft":
             return Response(
                 {"error": "Доступ запрещен или заявка не черновик"},
                 status=status.HTTP_403_FORBIDDEN,
             )
-
         service_id = request.data.get("service_id")
         if not service_id:
             return Response({"error": "Требуется поле service_id"}, status=status.HTTP_400_BAD_REQUEST)
-
         item = get_object_or_404(OrderItem, order=order, service_id=service_id)
         quantity = request.data.get("quantity")
         if quantity is not None:
             item.quantity = quantity
             item.save()
-
         self._recalculate(order)
         return Response(OrderSerializer(order).data)
 
@@ -260,13 +217,11 @@ class OrderViewSet(viewsets.ModelViewSet):
     def delete_item(self, request, pk=None, service_id=None):
         order = self.get_object()
         user = self.request.user
-
         if order.creator != user or order.status != "draft":
             return Response(
                 {"error": "Доступ запрещен или заявка не черновик"},
                 status=status.HTTP_403_FORBIDDEN,
             )
-
         OrderItem.objects.filter(order=order, service_id=service_id).delete()
         self._recalculate(order)
         return Response(OrderSerializer(order).data)
@@ -275,17 +230,14 @@ class OrderViewSet(viewsets.ModelViewSet):
     def update_item_legacy(self, request, pk=None):
         order = self.get_object()
         user = self.request.user
-
         if order.creator != user or order.status != "draft":
             return Response(
                 {"error": "Доступ запрещен или заявка не черновик"},
                 status=status.HTTP_403_FORBIDDEN,
             )
-
         item_id = request.data.get("item_id")
         action = request.data.get("action")
         order_item = get_object_or_404(OrderItem, id=item_id, order=order)
-
         if action == "increase":
             order_item.quantity += 1
         elif action == "decrease":
@@ -295,7 +247,6 @@ class OrderViewSet(viewsets.ModelViewSet):
                 order_item.delete()
                 self._recalculate(order)
                 return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
-
         order_item.save()
         self._recalculate(order)
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
@@ -304,13 +255,11 @@ class OrderViewSet(viewsets.ModelViewSet):
     def remove_item_legacy(self, request, pk=None):
         order = self.get_object()
         user = self.request.user
-
         if order.creator != user or order.status != "draft":
             return Response(
                 {"error": "Доступ запрещен или заявка не черновик"},
                 status=status.HTTP_403_FORBIDDEN,
             )
-
         item_id = request.data.get("item_id")
         OrderItem.objects.filter(id=item_id, order=order).delete()
         self._recalculate(order)
@@ -369,18 +318,10 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Response(OrderSerializer(order).data, status=status.HTTP_200_OK)
 
     def partial_update(self, request, pk=None, *args, **kwargs):
-        """
-        PATCH /api/orders/{id}/
-        - Создатель: любые поля (кроме статуса)
-        - Модератор: comment ИЛИ status
-        """
         order = self.get_object()
         user = self.request.user
-
-        # Проверка прав
         if order.creator != user and not user.is_staff:
             return Response({"error": "Доступ запрещен"}, status=status.HTTP_403_FORBIDDEN)
-
         if "comment" in request.data and request.data["comment"]:
             new_comment = request.data["comment"].strip()
             if new_comment:
@@ -391,7 +332,6 @@ class OrderViewSet(viewsets.ModelViewSet):
                 order.comment = existing + comment_entry
                 order.save(update_fields=["comment"])
                 return Response(OrderSerializer(order).data)
-
         if "status" in request.data and user.is_staff:
             new_status = request.data["status"]
             valid_statuses = ["draft", "formed", "completed", "rejected", "deleted"]
@@ -402,14 +342,12 @@ class OrderViewSet(viewsets.ModelViewSet):
                     order.moderator = None
                     order.save(update_fields=["status", "completed_at", "moderator"])
                     return Response(OrderSerializer(order).data)
-
                 order.status = new_status
                 if new_status in ["completed", "rejected"]:
                     order.completed_at = timezone.now()
                     order.moderator = user
                 order.save(update_fields=["status", "completed_at", "moderator"])
                 return Response(OrderSerializer(order).data)
-
         return super().partial_update(request, pk, *args, **kwargs)
 
     def _recalculate(self, order):
@@ -421,6 +359,7 @@ class OrderViewSet(viewsets.ModelViewSet):
 class UserProfileViewSet(viewsets.ModelViewSet):
     serializer_class = UserProfileSerializer
     permission_classes = [IsAuthenticated]
+    lookup_field = None  # Отключаем поиск по pk
 
     def get_queryset(self):
         user = self.request.user
@@ -428,20 +367,45 @@ class UserProfileViewSet(viewsets.ModelViewSet):
             return UserProfile.objects.filter(user=user)
         return UserProfile.objects.none()
 
+    def get_object(self):
+        # Всегда возвращаем профиль текущего пользователя
+        return self.get_queryset().first()
+
+    def retrieve(self, request, *args, **kwargs):
+        # GET /api/profiles/me/
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
+
+    def update(self, request, *args, **kwargs):
+        # PUT /api/profiles/me/
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=False)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def partial_update(self, request, *args, **kwargs):
+        # PATCH /api/profiles/me/
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
     @action(detail=False, methods=["post"], permission_classes=[AllowAny])
     def register(self, request):
         serializer = UserRegistrationSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
-            # auth_login(request, user)
-            # Успешная регистрация пользователя
             logger.info(f"Successful registration for user: {user.username}")
             AUTH_REGISTER_SUCCESS.inc()
             return Response(
                 {"id": user.id, "username": user.username, "message": "Регистрация успешна"},
                 status=status.HTTP_201_CREATED,
             )
-        # Попытка регистрации с ошибкой валидации
         logger.warning(f"Failed registration attempt: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -449,7 +413,6 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     def login(self, request):
         username = request.data.get("username")
         password = request.data.get("password")
-
         if not username or not password:
             logger.warning(f"Failed login attempt (missing credentials): {username}")
             AUTH_FAILURE.inc()
@@ -457,16 +420,13 @@ class UserProfileViewSet(viewsets.ModelViewSet):
                 {"error": "Имя пользователя и пароль обязательны"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-
         user = authenticate(request, username=username, password=password)
         if user is not None:
             auth_login(request, user)
             request.session.save()
-
             from django.middleware.csrf import get_token
 
             csrf_token = get_token(request)
-
             logger.info(f"Successful login for user: {username}")
             AUTH_SUCCESS.inc()
             return Response(
@@ -478,7 +438,6 @@ class UserProfileViewSet(viewsets.ModelViewSet):
                     "csrfToken": csrf_token,
                 }
             )
-
         logger.warning(f"Failed login attempt for user: {username}")
         AUTH_FAILURE.inc()
         return Response(
@@ -490,20 +449,20 @@ class UserProfileViewSet(viewsets.ModelViewSet):
     def logout(self, request):
         logger.info(f"Logout for user: {request.user.username}")
         auth_logout(request)
-
-        # ✅ Явно очищаем сессию
         request.session.flush()
-
         return Response({"message": "Выход успешен"})
 
-    @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated])
-    def me(self, request):
+    @action(detail=False, methods=["put"], url_path="me/change_password", permission_classes=[IsAuthenticated])
+    def change_password_action(self, request):
         user = request.user
-        return Response(
-            {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "is_staff": user.is_staff,
-            }
-        )
+        current_password = request.data.get("current_password")
+        new_password = request.data.get("new_password")
+        if not user.check_password(current_password):
+            return Response({"error": "Неверный текущий пароль"}, status=status.HTTP_400_BAD_REQUEST)
+        if len(new_password) < 8:
+            return Response(
+                {"error": "Пароль должен содержать не менее 8 символов"}, status=status.HTTP_400_BAD_REQUEST
+            )
+        user.set_password(new_password)
+        user.save()
+        return Response({"message": "Пароль успешно изменён"})

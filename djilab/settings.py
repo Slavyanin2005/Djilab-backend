@@ -22,15 +22,15 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "rest_framework",
     "corsheaders",
+    "rest_framework",
     "catalog",
     "drf_spectacular",
 ]
 
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",  # ✅ ПЕРВЫМ!
     "django_prometheus.middleware.PrometheusBeforeMiddleware",
-    "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -41,12 +41,25 @@ MIDDLEWARE = [
     "django_prometheus.middleware.PrometheusAfterMiddleware",
 ]
 
-CORS_ALLOWED_ORIGINS = config(
-    "CORS_ALLOWED_ORIGINS",
-    default="http://localhost:5173,http://127.0.0.1:5173,http://192.168.0.107:5173,tauri://localhost,http://localhost:1420,https://slavyanin2005.github.io",
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:4173",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://192.168.0.107:5173",
+    "http://tauri.localhost",
+    "tauri://localhost",
+    "http://localhost:1420",
+    "https://slavyanin2005.github.io",
+]
+
+CORS_ALLOW_CREDENTIALS = True
+
+CORS_ALLOW_HEADERS = config(
+    "CORS_ALLOW_HEADERS",
+    default="accept,accept-encoding,authorization,content-type,dnt,origin,user-agent,x-csrftoken,x-requested-with",
     cast=Csv(),
 )
-CORS_ALLOW_CREDENTIALS = config("CORS_ALLOW_CREDENTIALS", default=True, cast=bool)
+CORS_EXPOSE_HEADERS = ["set-cookie", "content-length", "content-type"]
 
 ROOT_URLCONF = "djilab.urls"
 
@@ -119,7 +132,6 @@ CACHES = {
     }
 }
 
-# TTL для кэша по умолчанию 60 секунд
 CACHE_TTL = 60
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -181,26 +193,27 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
 
-CORS_ALLOW_HEADERS = config(
-    "CORS_ALLOW_HEADERS",
-    default="accept,accept-encoding,authorization,content-type,dnt,origin,user-agent,x-csrftoken,x-requested-with",
-    cast=Csv(),
-)
-
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:5173",
+    "http://localhost:4173",
     "http://127.0.0.1:5173",
     "http://192.168.0.107:5173",
+    "http://tauri.localhost",
+    "https://192.168.0.107:8000",
     "http://backend:8000",
     "tauri://localhost",
     "http://localhost:1420",
     "https://slavyanin2005.github.io",
 ]
 
-SESSION_COOKIE_SAMESITE = config("SESSION_COOKIE_SAMESITE", default="Lax")
-SESSION_COOKIE_SECURE = config("SESSION_COOKIE_SECURE", default=False, cast=bool)
-CSRF_COOKIE_SAMESITE = config("CSRF_COOKIE_SAMESITE", default="Lax")
-CSRF_COOKIE_SECURE = config("CSRF_COOKIE_SECURE", default=False, cast=bool)
+SESSION_COOKIE_SAMESITE = "None"
+SESSION_COOKIE_SECURE = True
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_DOMAIN = None
+
+CSRF_COOKIE_SAMESITE = "None"
+CSRF_COOKIE_SECURE = True
+CSRF_COOKIE_HTTPONLY = False
 
 SPECTACULAR_SETTINGS = {
     "TITLE": "DJI Lab API",

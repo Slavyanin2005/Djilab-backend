@@ -433,7 +433,7 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         serializer = UserRegistrationSerializer(data=request.data)
         if serializer.is_valid():
             user = serializer.save()
-            auth_login(request, user)
+            # auth_login(request, user)
             # Успешная регистрация пользователя
             logger.info(f"Successful registration for user: {user.username}")
             AUTH_REGISTER_SUCCESS.inc()
@@ -451,7 +451,6 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         password = request.data.get("password")
 
         if not username or not password:
-            # Попытка входа без обязательных полей
             logger.warning(f"Failed login attempt (missing credentials): {username}")
             AUTH_FAILURE.inc()
             return Response(
@@ -462,7 +461,12 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         user = authenticate(request, username=username, password=password)
         if user is not None:
             auth_login(request, user)
-            # Успешный вход пользователя
+            request.session.save()
+
+            from django.middleware.csrf import get_token
+
+            csrf_token = get_token(request)
+
             logger.info(f"Successful login for user: {username}")
             AUTH_SUCCESS.inc()
             return Response(
@@ -471,10 +475,10 @@ class UserProfileViewSet(viewsets.ModelViewSet):
                     "username": user.username,
                     "id": user.id,
                     "is_staff": user.is_staff,
+                    "csrfToken": csrf_token,
                 }
             )
 
-        # Неверный пароль или пользователь
         logger.warning(f"Failed login attempt for user: {username}")
         AUTH_FAILURE.inc()
         return Response(
@@ -484,9 +488,12 @@ class UserProfileViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"], permission_classes=[IsAuthenticated])
     def logout(self, request):
-        # Выход пользователя из системы
         logger.info(f"Logout for user: {request.user.username}")
         auth_logout(request)
+
+        # ✅ Явно очищаем сессию
+        request.session.flush()
+
         return Response({"message": "Выход успешен"})
 
     @action(detail=False, methods=["get"], permission_classes=[IsAuthenticated])
